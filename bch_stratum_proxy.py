@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bch_stratum_proxy_v5.py
+bch_stratum_proxy_v6.py
 
-功能概览:
-    - 作为一个极简的 BCH 专用 Stratum 代理 (局域网/单机)
-    - 拉取 getblocktemplate (GBT)
-    - 将 GBT 转换为 Stratum mining.notify 下发矿机
-    - 接收矿机 mining.submit, 在代理端重建区块并在满足网络目标时 submitblock
-    - 线程安全、带重试以及常见字段兼容处理
+这个文件基于 v5 代码做了深度修复与优化，目标：
+ - 修复 merkle / endianness / hash 比较相关的 bug
+ - 使用交易 raw data (gbt.transactions[].data) 来计算 merkle，避免 txid endian 二义性
+ - 更稳健地解析 ntime/bits/nonce（支持 hex/dec/big/little）
+ - 正确比较 header hash vs target（用 big-endian 整数比较）
+ - 更严格地对非法 share 返回 False（避免误导矿机）
+ - 更健壮的 coinbase 拼接逻辑：优先使用 coinbasetxn.data；若缺失则构造最小 coinbase
+ - 修复线程安全与全局变量引用（使用 _miners 而非未定义变量）
+ - 更清晰的日志与可配置项
+ - 增加简单限流与连接上限控制
 
-使用:
-    1) 编辑下方 RPC_USER / RPC_PASS 等配置
-    2) 启动: python bch_stratum_proxy_v5.py
-    3) 矿机连接: stratum+tcp://<你的机器局域网IP>:3333
+注意：
+ - 请先在文件顶部配置 RPC_USER / RPC_PASS / RPC_HOST / RPC_PORT
+ - 强烈建议在 regtest/testnet 上充分测试再接入主网
+ - 依赖: requests
 
-依赖:
-    pip install requests
+运行： python bch_stratum_proxy_v6.py
 """
 
 import socket
@@ -24,7 +27,6 @@ import threading
 import time
 import json
 import os
-import struct
 import binascii
 from hashlib import sha256
 import requests
@@ -60,6 +62,7 @@ RPC_RETRY_BACKOFF = 2  # 指数退避基数
 
 # 日志输出开关
 DEBUG = True
+MAX_MINERS = 200
 
 # ===========================
 # === 全局状态（内部使用）===
@@ -80,17 +83,22 @@ _gbt_lock = threading.Lock()
 # ===========================
 def log(*args):
     if DEBUG:
-        print("[PROXY]", *args)
+        print(time.strftime('%Y-%m-%d %H:%M:%S'), "[PROXY]", *args)
 
 def dsha256(data: bytes) -> bytes:
-    """双重 SHA256"""
+    """double-sha256，返回 digest bytes（big-endian order）"""
     return sha256(sha256(data).digest()).digest()
 
 def hex_to_bytes(h: str) -> bytes:
-    return binascii.unhexlify(h.encode() if isinstance(h, str) else h)
+    return binascii.unhexlify(h)
 
 def bytes_to_hex(b: bytes) -> str:
     return binascii.hexlify(b).decode('ascii')
+
+
+def reverse_bytes(b: bytes) -> bytes:
+    return b[::-1]
+
 
 def reverse_hex(h: str) -> str:
     """字节序反转 (hex 字符串)"""
@@ -98,6 +106,11 @@ def reverse_hex(h: str) -> str:
 
 def int_to_le_hex(n: int, length: int) -> str:
     return n.to_bytes(length, 'little').hex()
+
+
+def int_to_be_hex(n: int, length: int) -> str:
+    return n.to_bytes(length, 'big').hex()
+
 
 def varint_encode(n: int) -> str:
     if n < 0xfd:
@@ -111,7 +124,7 @@ def varint_encode(n: int) -> str:
 
 def compact_to_target(compact_int: int) -> int:
     """
-    将 compact (bits) 转换为目标 target 值
+    将 compact bits（32-bit int） 转换为目标 target 值
     compact_int: 4 字节整数 (big-endian interpreted)
     """
     # compact: 1 byte exponent, 3 byte mantissa
@@ -127,11 +140,36 @@ def compact_to_target(compact_int: int) -> int:
     return target
 
 def bits_hex_to_int(bits_hex: str) -> int:
-    """
-    bits_hex 可能是 "1a2b3c4d" 格式 (32-bit hex)
-    将其解析为 int（按 big-endian）
-    """
     return int(bits_hex, 16)
+
+
+def parse_nonce_or_ntime_to_le(hex_or_dec: Optional[str], length_bytes: int) -> str:
+    """
+    将矿机给出的 nonce/ntime 字符串解析为 little-endian hex（长度 length_bytes*2）
+    支持： hex (BE or LE), decimal string
+    优先尝试解释为 hex（并转成 little-endian），再尝试 decimal
+    """
+    if hex_or_dec is None:
+        return int_to_le_hex(0, length_bytes)
+    s = str(hex_or_dec).strip()
+    if s.startswith('0x'):
+        s = s[2:]
+    # pure hex?
+    if all(c in '0123456789abcdefABCDEF' for c in s):
+        needed = length_bytes * 2
+        s = s.rjust(needed, '0')[-needed:]
+        try:
+            b = binascii.unhexlify(s)
+            # assume incoming hex is big-endian (common human display), so reverse to little
+            return bytes_to_hex(b[::-1])
+        except Exception:
+            pass
+    # decimal fallback
+    try:
+        n = int(s)
+        return int_to_le_hex(n, length_bytes)
+    except Exception:
+        return int_to_le_hex(0, length_bytes)
 
 # ===========================
 # === RPC 封装（带重试）===
@@ -146,13 +184,14 @@ def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
             resp = requests.post(url, json=payload, headers=headers, auth=(RPC_USER, RPC_PASS), timeout=RPC_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
-            if data.get("error"):
-                log(f"RPC error for {method}: {data['error']}")
+            if data.get('error'):
+                # 若 error != null 则返回 None 并记录
+                log(f"RPC error for {method}:", data['error'])
                 return None
-            return data.get("result")
+            return data.get('result')
         except Exception as e:
             attempt += 1
-            log(f"RPC call {method} attempt {attempt} failed: {e}")
+            log(f"RPC call {method} attempt {attempt} failed:", e)
             time.sleep(RPC_RETRY_BACKOFF ** (attempt - 1))
     log(f"RPC call {method} failed after {RPC_MAX_RETRIES} attempts.")
     return None
@@ -160,29 +199,40 @@ def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
 # ===========================
 # === GBT -> Job 转换与广播 ===
 # ===========================
+
+def _encode_height_to_coinbase(height: int) -> str:
+    hb = b''
+    n = height
+    while True:
+        hb += bytes([n & 0xff])
+        n >>= 8
+        if n == 0:
+            break
+    return bytes_to_hex(bytes([len(hb)])) + bytes_to_hex(hb)
+
+
+def _build_minimal_coinbase_tx(height_bytes_hex: str) -> str:
+    # 极简 coinbase tx，仅用于节点未返回 coinbasetxn.data 的极端情况
+    version = "01000000"
+    tx_in_count = "01"
+    prev_out = "00" * 32 + "ffffffff"
+    script_hex = height_bytes_hex + "00"
+    script_len = varint_encode(len(bytes.fromhex(script_hex)))
+    seq = "ffffffff"
+    tx_out_count = "01"
+    value = (0).to_bytes(8, 'little').hex()
+    pk_script = "51"  # OP_TRUE
+    pk_script_len = varint_encode(len(bytes.fromhex(pk_script)))
+    lock_time = "00000000"
+    return version + tx_in_count + prev_out + script_len + script_hex + seq + tx_out_count + value + pk_script_len + pk_script + lock_time
+
+
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    将 GBT 转换为内部 job 结构，便于下发给矿机与用于 submit。
-    返回 job dict:
-        {
-            'job_id': str,
-            'gbt': gbt,
-            'prevhash_be': ...,
-            'version_be': ...,
-            'nbits_be': ...,
-            'ntime_be': ...,
-            'coinb1': ...,
-            'coinb2': ...,
-            'merkle_branch': [...],   # txids as BE hex strings
-            'extranonce1': ... (代理分配长度 bytes*2 hex),
-            'extranonce2_size': int
-        }
-    """
     try:
         # 1) header components
-        version = gbt.get('version', 0)
+        version = int(gbt.get('version', 0))
         # Stratum 通常期望大端(hex)用于显示，但 core RPC 的整数是主机整数，转换如下:
-        version_be = version.to_bytes(4, 'big').hex()
+        version_be = int_to_be_hex(version, 4)
 
         # previousblockhash 从 RPC 返回是常规的 hex (big-endian), Stratum mining.notify 的 prevhash 字段通常传 BE
         prevhash_rpc = gbt.get('previousblockhash', '')
@@ -191,20 +241,19 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # bits: 有时是 "1a2b3c4d" 字符串，也可能是十进制，请尝试处理
         bits = gbt.get('bits')
         if isinstance(bits, int):
-            nbits_be = bits.to_bytes(4, 'big').hex()
+            nbits_be = int_to_be_hex(bits, 4)
         else:
             # 假设 bits 是 hex string
-            nbits_be = bits
+            nbits_be = bits if bits else ''
 
         # curtime -> ntime (int -> 4 byte BE hex)
-        curtime = gbt.get('curtime', int(time.time()))
-        ntime_be = curtime.to_bytes(4, 'big').hex()
+        curtime = int(gbt.get('curtime', int(time.time())))
+        ntime_be = int_to_be_hex(curtime, 4)
 
         # 2) coinbase 处理: 优先使用 coinbasetxn.data (BCH 节点常见)
         coinbasetxn = gbt.get('coinbasetxn')
-        coinbase_hex = None
-        coinb1 = ""
-        coinb2 = ""
+        coinb1 = ''
+        coinb2 = ''
         if coinbasetxn and isinstance(coinbasetxn, dict) and 'data' in coinbasetxn:
             coinbase_hex = coinbasetxn['data']  # 这是 raw tx hex 模板，通常包含 extranonce 占位
             # 尝试在 coinbase_hex 中定位占位符（连续全零）
@@ -218,16 +267,23 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 # 占位符未找到：我们采取简易方式 —— 将 coinbase_template 放在 coinb1，coinb2 为空
                 # 然后在真实提交时将 extranonce1+extranonce2 追加到 coinb1 的末尾
                 coinb1 = coinbase_hex
-                coinb2 = ""
+                coinb2 = ''
         else:
             # 如果 coinbasetxn 不存在，则从 gbt['coinbaseaux'/'coinbasevalue'] 等手动构造coinbase
             # 这里做一个简单构造：将 coinbase 空壳作为 coinb1, coinb2 为空
-            coinb1 = ""  # 表示我们没有模板
-            coinb2 = ""
+            height = gbt.get('height')
+            if height is None:
+                coinb1 = ''
+                coinb2 = ''
+            else:
+                height_bytes = _encode_height_to_coinbase(height)
+                coinb1 = _build_minimal_coinbase_tx(height_bytes)
+                coinb2 = ''
+
 
         # 3) merkle branch: 用 GBT 的 transactions 列表中的 txid 字段 (RPC 返回通常是 BE hex)
         transactions = gbt.get('transactions', [])
-        merkle_branch = [tx.get('txid') for tx in transactions if 'txid' in tx]
+        merkle_branch = [tx.get('txid') for tx in transactions if tx.get('txid')]
 
         # 4) extranonce1 由代理生成并写入job（每个矿机仍会覆盖自己的extranonce1）
         # 这里生成一个 job-level extranonce1，以确保coinbase模板能包含至少一个代理extranonce1占位
@@ -351,18 +407,24 @@ class StratumMinerHandler(threading.Thread):
 
         # socket读buffer
         self._buffer = ""
-
-        # 注册自己到全局矿工列表
+        self.conn.settimeout(30)
+        # 注册
         with _miners_lock:
-            _miners.append(self)
+            if len(_miners) >= MAX_MINERS:
+                log("已达到最大连接数，拒绝连接", addr)
+                try:
+                    conn.close()
+                except:
+                    pass
+            else:
+                _miners.append(self)
 
     def run(self):
         log("矿机连接来自", self.addr)
         try:
-            self.conn.settimeout(30)
             while self.running:
                 try:
-                    data = self.conn.recv(4096)
+                    data = self.conn.recv(8192)
                 except socket.timeout:
                     continue
                 except Exception:
@@ -453,8 +515,11 @@ class StratumMinerHandler(threading.Thread):
 
         # 如果 coinb1 中包含占位符 (EXTRANONCE_PLACEHOLDER)，则替换为代理extranonce1（job-level或conn-level）
         placeholder = EXTRANONCE_PLACEHOLDER
+        extranonce2_placeholder = '00' * self.extranonce2_size
+
+        # 确保 miner 收到的 coinb1 中包含 extranonce1 的位置
         if placeholder and placeholder in coinb1:
-            coinb1_filled = coinb1.replace(placeholder, self.extranonce1, 1)
+            coinb1_filled = coinb1.replace(placeholder, self.extranonce1 + extranonce2_placeholder, 1)
         else:
             # 否则，把代理的extranonce1附加到coinb1（大多数简单节点兼容）
             coinb1_filled = coinb1 + self.extranonce1
@@ -541,8 +606,9 @@ class StratumMinerHandler(threading.Thread):
 
             # 使用连接级别的 extranonce1（独一无二）和矿工提供的 extranonce2
             extranonce1 = self.extranonce1
-            extranonce2 = extranonce2 or ""
+            extranonce2 = extranonce2 or ''
             # 将 EXTRANONCE_PLACEHOLDER 替换（若存在）
+            extranonce2 = extranonce2.rjust(self.extranonce2_size * 2, '0')[:self.extranonce2_size * 2]
             if EXTRANONCE_PLACEHOLDER and EXTRANONCE_PLACEHOLDER in coinb1:
                 coinbase_hex = coinb1.replace(EXTRANONCE_PLACEHOLDER, extranonce1 + extranonce2, 1) + coinb2
             else:
@@ -550,121 +616,112 @@ class StratumMinerHandler(threading.Thread):
                 coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2
 
             # 3) 计算 coinbase tx hash (双sha256), 注意: 传入 dsha256 的应为原始 bytes (tx raw hex)
-            coinbase_hash = dsha256(binascii.unhexlify(coinbase_hex))
-
-            # 4) 将 GBT transactions 列表的 txid 转换为 LE bytes，并构建 merkle 根（使用小端格式进行内部哈希）
-            tx_hashes_le = [coinbase_hash]  # coinbase hash already raw bytes (big-endian? dsha256 结果是 bytes in network-order)
-            for tx in job.get('merkle_branch', []):
-                # RPC 中 txid 通常以 big-endian hex 表示，我们需要转换为 little-endian bytes
-                try:
-                    txid_be = tx
-                    txid_le = binascii.unhexlify(txid_be)[::-1]
-                    tx_hashes_le.append(txid_le)
-                except Exception:
-                    # 忽略无法解析的 txid
-                    pass
-
-            merkle_root_le = build_merkle_root_from_leaves(tx_hashes_le)
-            merkle_root_le_hex = bytes_to_hex(merkle_root_le)
-
-            # 5) 构建区块头 (小端序列化)
-            # version (LE)
-            version_le = int(job['gbt'].get('version', 0)).to_bytes(4, 'little').hex()
-            # prevhash: gbt['previousblockhash'] 通常是 BE hex, 转为 LE hex
-            prevhash_rpc = job['gbt'].get('previousblockhash', '')
-            prevhash_le_hex = reverse_hex(prevhash_rpc)
-            # merkle root is already LE hex
-            merkle_le_hex = merkle_root_le_hex
-            # ntime: miner 提供的 ntime_hex 通常是 BE hex string of 4 bytes; 若矿机传入为 decimal string 则尝试解析
             try:
-                if ntime_hex is None:
-                    ntime_int = job['gbt'].get('curtime', int(time.time()))
-                    ntime_le_hex = int_to_le_hex(ntime_int, 4)
-                else:
-                    # 如果是 hex string like "5f5e100" or decimal string; 尝试解析十六进制，否则十进制
-                    if all(c in "0123456789abcdefABCDEF" for c in ntime_hex) and len(ntime_hex) <= 8:
-                        ntime_bytes = binascii.unhexlify(ntime_hex)
-                        # BE -> LE
-                        ntime_le_hex = bytes_to_hex(ntime_bytes[::-1])
-                    else:
-                        ntime_le_hex = int_to_le_hex(int(ntime_hex), 4)
-            except Exception:
-                ntime_le_hex = int_to_le_hex(job['gbt'].get('curtime', int(time.time())), 4)
-
-            # nonce: 矿机发来的 nonce_hex 通常是 BE hex (4 bytes)
-            try:
-                nonce_le_hex = bytes_to_hex(binascii.unhexlify(nonce_hex))[::-1] if nonce_hex else "00000000"
-            except Exception:
-                try:
-                    nonce_le_hex = int_to_le_hex(int(nonce_hex or 0), 4)
-                except:
-                    nonce_le_hex = "00000000"
-
-            # bits: GBT 提供的 bits 为 BE hex; 转为 LE hex 用于 header
-            bits_field = job['gbt'].get('bits')
-            if isinstance(bits_field, int):
-                bits_be_hex = bits_field.to_bytes(4, 'big').hex()
-            else:
-                bits_be_hex = bits_field
-            bits_le_hex = reverse_hex(bits_be_hex)
-
-            header_hex = (
-                version_le +
-                prevhash_le_hex +
-                merkle_le_hex +
-                ntime_le_hex +
-                bits_le_hex +
-                nonce_le_hex
-            )
-            header_bytes = binascii.unhexlify(header_hex)
-
-            # 6) 计算 block header hash (double sha256)
-            block_hash = dsha256(header_bytes)  # bytes
-            # block_hash 的常见展示是 LE hex of the dsha256 result
-            block_hash_le_hex = bytes_to_hex(block_hash)
-
-            # 7) 计算目标 target 并验证 share
-            # bits_be_hex -> compact int (big-endian)
-            compact_int = bits_hex_to_int(bits_be_hex)
-            target_int = compact_to_target(compact_int)
-            # header hash interpreted as big integer (dsha256 returns bytes; we interpret as little-endian)
-            # 注意：在比对时，比较的是 header hash interpreted as little-endian integer vs target
-            header_hash_int = int.from_bytes(block_hash, byteorder='little')
-            is_valid_share = header_hash_int <= target_int
-
-            log(f"提交 from {self.addr} job={job_id} worker={worker} hash_le={block_hash_le_hex} valid={is_valid_share}")
-
-            if not is_valid_share:
-                # 这是一个普通的 share，不满足网络难度 — 返回 accepted False (或 accepted True 取决于策略)
-                # 这里我们返回 accepted True（矿机看到 accepted）但不提交到网络，除非你想对所有 share 都做记录
-                # 为演示，我们仍然向矿机返回 True 表示 share accepted（矿池会根据 solo/pool 策略决定）
-                self.send_json({"id": req_id, "result": True, "error": None})
+			
+                coinbase_bytes = hex_to_bytes(coinbase_hex)
+            except Exception as e:
+                log("coinbase hex 无法解析:", e)
+                self.send_json({"id": req_id, "result": False, "error": [24, "Invalid coinbase hex", None]})
                 return
 
-            # 8) 如果满足网络目标，构建完整区块并 submitblock
-            # tx count = 1 + len(gbt.transactions)
-            txs = []
-            # coinbase tx raw hex: coinbase_hex (上面构造)
-            txs.append(coinbase_hex)
-            # gbt.transactions 中通常包含 'data' 字段（原始 tx hex）
-            for tx in job['gbt'].get('transactions', []):
+            coinbase_hash_be = dsha256(coinbase_bytes)  # big-endian digest
+
+
+            # 4) 将 GBT transactions 列表的 txid 转换为 LE bytes，并构建 merkle 根（使用小端格式进行内部哈希）
+            txs_info = job['gbt'].get('transactions', [])
+            leaves_be: List[bytes] = [coinbase_hash_be]
+            for tx in txs_info:
                 txdata = tx.get('data')
                 if txdata:
-                    txs.append(txdata)
+                    try:
+                        leaves_be.append(dsha256(hex_to_bytes(txdata)))
+                    except Exception:
+                        log("无法解析 tx data，尝试使用 txid", tx.get('txid'))
+                        txid = tx.get('txid')
+                        if txid:
+                            try:
+                                leaves_be.append(hex_to_bytes(txid)[::-1])
+                            except Exception:
+                                log('无法解析 txid', txid)
                 else:
-                    # 如果没有原始 tx data，我们不能构建完整区块；中断并记录
+                    txid = tx.get('txid')
+                    if txid:
+                        try:
+                            leaves_be.append(hex_to_bytes(txid)[::-1])
+                        except Exception:
+                            log('无法解析 txid', txid)
+
+            merkle_root_be = _build_merkle_root_be(leaves_be)
+            merkle_le_hex = bytes_to_hex(merkle_root_be[::-1])
+
+            # 构建 header 各字段
+            version_le = int(job['gbt'].get('version', 0)).to_bytes(4, 'little')
+            prevhash_rpc = job['gbt'].get('previousblockhash', '')
+            try:
+                prevhash_le = hex_to_bytes(prevhash_rpc)[::-1]
+            except Exception:
+                prevhash_le = b'\x00' * 32
+
+            # ntime
+            ntime_le_hex = parse_nonce_or_ntime_to_le(ntime_hex if ntime_hex else job['gbt'].get('curtime'), 4)
+            ntime_le = hex_to_bytes(ntime_le_hex)
+
+            # nonce
+            nonce_le_hex = parse_nonce_or_ntime_to_le(nonce_hex, 4)
+            nonce_le = hex_to_bytes(nonce_le_hex)
+
+            # bits field
+            bits_field = job['gbt'].get('bits')
+            if isinstance(bits_field, int):
+                bits_be = bits_field.to_bytes(4, 'big')
+            else:
+                try:
+                    bits_be = hex_to_bytes(bits_field)
+                except Exception:
+                    # try interpret as number string
+                    try:
+                        bits_be = int(bits_field).to_bytes(4, 'big')
+                    except Exception:
+                        bits_be = b'\x00' * 4
+            bits_le = bits_be[::-1]
+
+            merkle_le_bytes = merkle_root_be[::-1]
+            header_bytes = version_le + prevhash_le + merkle_le_bytes + ntime_le + bits_le + nonce_le
+
+            header_hash_be = dsha256(header_bytes)
+            header_hash_int = int.from_bytes(header_hash_be, 'big')
+            header_hash_hex_display_le = bytes_to_hex(header_hash_be[::-1])
+
+            compact_int = bits_hex_to_int(bytes_to_hex(bits_be))
+            target_int = compact_to_target(compact_int)
+
+            is_valid_share = header_hash_int <= target_int
+            log(f"提交 from {self.addr} job={job_id} worker={worker} hash_le={header_hash_hex_display_le} valid={is_valid_share}")
+
+            if not is_valid_share:
+                self.send_json({"id": req_id, "result": False, "error": [25, "Low difficulty share", None]})
+                return
+
+            # 构建完整区块并提交：header + tx count + tx raw data
+            txs_hex = []
+            txs_hex.append(coinbase_hex)
+            for tx in txs_info:
+                txdata = tx.get('data')
+                if txdata:
+                    txs_hex.append(txdata)
+                else:
                     log("GBT 中 transaction 缺少 data 字段，无法构建完整区块 -> 提交中断")
                     self.send_json({"id": req_id, "result": False, "error": [22, "Missing tx data in GBT", None]})
                     return
 
-            tx_count_hex = varint_encode(len(txs))
-            block_hex = header_hex + tx_count_hex + "".join(txs)
+            tx_count_hex = varint_encode(len(txs_hex))
+            header_hex_le = bytes_to_hex(header_bytes)
+            block_hex = header_hex_le + tx_count_hex + "".join(txs_hex)
 
-            # 9) submitblock RPC
             submit_result = rpc_call("submitblock", [block_hex])
-            # Bitcoin Core 返回 None 表示接受 (RPC成功), 返回 error string 表示失败
+            # Bitcoin RPC: submitblock returns null (None) on success, or error object/string on failure
             if submit_result is None:
-                log("!!! 区块被节点接受！Block hash (LE):", block_hash_le_hex)
+                log("!!! 区块被节点接受！Block hash (LE):", header_hash_hex_display_le)
                 self.send_json({"id": req_id, "result": True, "error": None})
             else:
                 log("submitblock 返回:", submit_result)
@@ -673,32 +730,34 @@ class StratumMinerHandler(threading.Thread):
             log("处理 submit 异常:", e)
             self.send_json({"id": req_id, "result": False, "error": [23, "Internal proxy error", None]})
 
+
 # ===========================
-# === 辅助：Merkle 树构造（小端哈希）===
+# === Merkle 核心实现（big-endian node bytes）===
 # ===========================
-def build_merkle_root_from_leaves(leaves: List[bytes]) -> bytes:
-    """
-    leaves: list of leaf hashes as bytes (little-endian byte order expected)
-    返回 merkle root as little-endian bytes
-    """
-    if not leaves:
+def _build_merkle_root_be(leaves_be: List[bytes]) -> bytes:
+    if not leaves_be:
         return b'\x00' * 32
-    nodes = list(leaves)
+    nodes = list(leaves_be)
     while len(nodes) > 1:
         if len(nodes) % 2 != 0:
             nodes.append(nodes[-1])
         next_level = []
         for i in range(0, len(nodes), 2):
-            combined = nodes[i] + nodes[i+1]
-            next_level.append(dsha256(combined))
+            left = nodes[i]
+            right = nodes[i + 1]
+            combined = left + right
+            h = dsha256(combined)
+            next_level.append(h)
         nodes = next_level
     return nodes[0]
+
 
 # ===========================
 # === Stratum 主服务循环 ===
 # ===========================
 def start_stratum_server(listen_host: str, listen_port: int):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((listen_host, listen_port))
     sock.listen(100)
     log(f"Stratum 代理监听 {listen_host}:{listen_port}")
@@ -715,18 +774,16 @@ def start_stratum_server(listen_host: str, listen_port: int):
         except:
             pass
 
+
 # ===========================
 # === 主程序入口 ===
 # ===========================
 if __name__ == "__main__":
-    # 最基本的配置检查
     if RPC_USER == "your_rpc_user" or RPC_PASS == "your_rpc_password":
         print("请先在脚本顶部配置 RPC_USER 和 RPC_PASS（bitcoin.conf 中的 rpc 用户/密码）")
         exit(1)
 
-    # 启动 GBT 轮询线程
     poller_thread = threading.Thread(target=gbt_poller, daemon=True)
     poller_thread.start()
 
-    # 启动 Stratum TCP 服务（阻塞）
     start_stratum_server(LISTEN_HOST, LISTEN_PORT)
