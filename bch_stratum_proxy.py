@@ -59,6 +59,9 @@ EXTRANONCE_PLACEHOLDER = "00" * (EXTRANONCE1_BYTES + EXTRANONCE2_BYTES)
 # 默认支付地址（当矿工未提供时使用）
 DEFAULT_PAYOUT_ADDRESS = "bitcoincash:your_default_address_here"
 
+# 设置ASIC矿机有效share的最小难度
+MIN_SHARE_DIFF = 100_000  # 全局配置，矿机提交的share难度必须大于100K
+
 # RPC 调用超时和重试
 RPC_TIMEOUT = 10
 RPC_MAX_RETRIES = 3
@@ -127,19 +130,34 @@ def varint_encode(n: int) -> str:
     else:
         return "ff" + int_to_le_hex(n, 8)
 
-def compact_to_target(compact_int: int) -> int:
+def compact_to_target(nbits_hex: str) -> int:
     """
-    将 compact bits（32-bit int） 转换为目标 target 值
-    compact_int: 4 字节整数 (big-endian interpreted)
+    将 nbits (hex string, big-endian) 转换为 target (int)
+    例如: "1a2b3c4d" → target = 0x2b3c4d << (8 * (0x1a - 3))
     """
-    # compact: 1 byte exponent, 3 byte mantissa
-    size = compact_int >> 24
-    mantissa = compact_int & 0x7FFFFF
-    if size <= 3:
-        target = mantissa >> (8 * (3 - size))
-    else:
-        target = mantissa << (8 * (size - 3))
-    return target
+    try:
+        nbits_bytes = hex_to_bytes(nbits_hex)
+        if len(nbits_bytes) != 4:
+            return 0
+
+        # 大端读取 32-bit
+        compact = int.from_bytes(nbits_bytes, 'big')
+        size = compact >> 24
+        mantissa = compact & 0xFFFFFF  # 24-bit
+
+        if size <= 3:
+            target = mantissa >> (8 * (3 - size))
+        else:
+            target = mantissa << (8 * (size - 3))
+
+        # 防止溢出
+        if target.bit_length() > 256:
+            target = (1 << 256) - 1
+
+        return target
+    except Exception as e:
+        log("compact_to_target 错误:", e)
+        return 0
 
 def bits_hex_to_int(bits_hex: str) -> int:
     return int(bits_hex, 16)
@@ -609,7 +627,7 @@ class StratumMinerHandler(threading.Thread):
         if not job:
             return
         # 下发难度（solo 挖矿用网络难度）
-        difficulty = 1  # 或从 nbits 计算
+        difficulty = MIN_SHARE_DIFF  # 或从 nbits 计算
         diff_msg = {"id": None, "method": "mining.set_difficulty", "params": [difficulty]}
         self.send_json(diff_msg)
 
@@ -628,8 +646,8 @@ class StratumMinerHandler(threading.Thread):
         if placeholder and placeholder in coinb1:
             coinb1_filled = coinb1.replace(placeholder, self.extranonce1 + extranonce2_placeholder, 1)
         else:
-            # 否则，把代理的extranonce1附加到coinb1（大多数简单节点兼容）
-            coinb1_filled = coinb1 + self.extranonce1
+            # 无占位符：coinb1 已完整，不要追加 extranonce1
+            coinb1_filled = coinb1
 
         # job id
         jid = job.get('job_id')
@@ -727,7 +745,7 @@ class StratumMinerHandler(threading.Thread):
             if EXTRANONCE_PLACEHOLDER in coinb1:
                 coinbase_hex = coinb1.replace(EXTRANONCE_PLACEHOLDER, self.extranonce1 + ex2, 1) + coinb2
             else:
-                coinbase_hex = coinb1 + self.extranonce1 + ex2 + coinb2
+                coinbase_hex = coinb1 + ex2  # 只加 ex2，不要加 extranonce1！
 
             # ---------- 2. merkle ----------
             """
@@ -746,42 +764,71 @@ class StratumMinerHandler(threading.Thread):
             merkle_root_be = _build_merkle_root_be(leaves_be)
 
             # ---------- 3. header (BE) ----------
-            version_be = int_to_be_hex(gbt.get('version', 0), 4)
-            prevhash_be = gbt.get('previousblockhash', '')
-            ntime_be = _clean_hex(ntime_hex, 8)  # 矿机给 BE
-            nonce_be = _clean_hex(nonce_hex, 8)
-            nbits_be = job.get('nbits_be')
+            version_le = int_to_le_hex(gbt.get('version', 0), 4)
+            prevhash_le    = reverse_hex(job.get('prevhash_be'))  # BE hex → LE hex
 
-            header_be = (
-                version_be + prevhash_be + bytes_to_hex(merkle_root_be) +
-                ntime_be + nbits_be + nonce_be
+            merkle_root_be_hex = bytes_to_hex(merkle_root_be)  # BE bytes → BE hex
+            merkle_root_le = reverse_hex(merkle_root_be_hex)  # BE hex → LE hex
+
+            nbits_le = reverse_hex(job.get('nbits_be'))  # BE hex → LE hex
+            ntime_le = reverse_hex((ntime_hex or '').rjust(8, '0')[:8])# BE hex → LE hex
+            nonce_le = reverse_hex((nonce_hex or '').rjust(8, '0')[:8])# BE hex → LE hex
+            
+            header_le = (
+                version_le + prevhash_le + merkle_root_le +
+                ntime_le + nbits_le + nonce_le
             )
-            header_hash_be = dsha256(hex_to_bytes(header_be))
-            header_hash_int = int.from_bytes(header_hash_be, 'big')
+            header_le_bytes = hex_to_bytes(header_le)
 
-            target = compact_to_target(bits_hex_to_int(nbits_be))
-            if header_hash_int > target:
-                self.send_json({"id": req_id, "result": False, "error": [25, "Low diff", None]})
+            header_hash_le_bytes = dsha256(header_le_bytes)
+
+            # 反转 digest 得到 BE block hash bytes
+            header_hash_be_bytes = reverse_bytes(header_hash_le_bytes)
+
+            header_hash_int = int.from_bytes(header_hash_be_bytes, 'big')
+
+            # 修复 target 为 BE int
+            network_target = compact_to_target(job.get('nbits_be'))
+
+            if network_target == 0:
+                self.send_json({"id": req_id, "result": False, "error": [23, "Invalid target", None]})
                 return
 
-            # ---------- 4. block (BE) ----------
-            txs = [coinbase_hex]
-            for tx in gbt.get('transactions', []):
-                if tx.get('data'):
-                    txs.append(tx['data'])
-            if gbt.get('default_witness_commitment'):
-                txs.append(gbt['default_witness_commitment'])
+            # 计算 share 难度（简化：2^256 / header_hash）
+            # 精确计算：diff = 2^256 / (header_hash_int + 1)
+            # 但为避免大数，近似用：diff ≈ 2^256 / header_hash
+            share_diff = pow(2, 256) // (header_hash_int + 1)
 
-            block_bytes = hex_to_bytes(header_be)
-            block_bytes += hex_to_bytes(varint_encode(len(txs)))
-            for t in txs:
-                block_bytes += hex_to_bytes(t)
+            # 1. 难度太低 → reject
+            if share_diff < MIN_SHARE_DIFF:
+                self.send_json({"id": req_id, "result": False, "error": [25, "Low diff", None]})
+                log(f"拒绝 share: diff={share_diff} (未达最小提交难度 {MIN_SHARE_DIFF}，不上报)")
+                return
 
-            result = rpc_call("submitblock", [bytes_to_hex(block_bytes)])
-            accepted = result is None
-            self.send_json({"id": req_id, "result": accepted, "error": None if accepted else [22, str(result), None]})
-            log(f"{'接受' if accepted else '拒绝'} share {header_hash_int:064x}")
+            # 2. 达到网络难度 → submitblock
+            if header_hash_int <= network_target:
+                # 构造完整区块并提交
+                txs = [coinbase_hex]
+                for tx in gbt.get('transactions', []):
+                    if tx.get('data'):
+                        txs.append(tx['data'])
+                if gbt.get('default_witness_commitment'):
+                    txs.append(gbt['default_witness_commitment'])
 
+                block_bytes = hex_to_bytes(header_le)  # 注意: 用 header_le
+                block_bytes += hex_to_bytes(varint_encode(len(txs)))
+                for t in txs:
+                    block_bytes += hex_to_bytes(t)
+
+                result = rpc_call("submitblock", [bytes_to_hex(block_bytes)])
+                accepted = result is None
+                self.send_json({"id": req_id, "result": accepted, "error": None if accepted else [22, str(result), None]})
+                log(f"区块提交: {'成功' if accepted else '失败'} share_diff={share_diff} hash={header_hash_int:064x}")
+            else:
+                # 3. 达到 MIN_SHARE_DIFF 但未达网络难度 → accept 但不上报
+                self.send_json({"id": req_id, "result": True, "error": None})
+                log(f"接受 share: diff={share_diff} (未达网络难度，不上报)")
+            return
         except Exception as e:
             log("处理 submit 异常:", e)
             self.send_json({"id": req_id, "result": False, "error": [23, "Internal proxy error", None]})
@@ -792,29 +839,21 @@ class StratumMinerHandler(threading.Thread):
 # ===========================
 def _build_merkle_root_be(leaves_be: List[bytes]) -> bytes:
     """
+    标准 Merkle Tree 构造（big-endian hash）
+    输入：所有交易的 double-sha256 hash（BE bytes）
+    输出：merkle root（BE bytes）
+    """
     if not leaves_be:
         return b'\x00' * 32
-    nodes = list(leaves_be)
+    nodes = leaves_be[:]
     while len(nodes) > 1:
-        if len(nodes) % 2 != 0:
-            nodes.append(nodes[-1])
+        if len(nodes) % 2 == 1:
+            nodes.append(nodes[-1])  # 奇数时复制最后一个
         next_level = []
         for i in range(0, len(nodes), 2):
             left = nodes[i]
             right = nodes[i + 1]
             combined = left + right
-            h = dsha256(combined)
-            next_level.append(h)
-        nodes = next_level
-    return nodes[0]
-    """
-    nodes = leaves_be[:]
-    while len(nodes) > 1:
-        if len(nodes) % 2:
-            nodes.append(nodes[-1])
-        next_level = []
-        for i in range(0, len(nodes), 2):
-            combined = nodes[i] + nodes[i + 1]
             next_level.append(dsha256(combined))
         nodes = next_level
     return nodes[0]
