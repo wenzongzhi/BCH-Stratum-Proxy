@@ -283,6 +283,36 @@ def build_coinbase_tx(height: int, payout_address: str, coinbase_value: int, ext
         script_len + coinbase_script + sequence +
         out_count + value_hex + script_len_out + script + locktime
     )
+    
+# 计算从 coinbase 到 root 的路径
+def _compute_merkle_branch(coinbase_hash_be: bytes, tx_hashes_be: List[bytes]) -> List[str]:
+    """
+    计算从 coinbase 到 merkle root 的路径（不包含 coinbase 本身）
+    返回 BE hex 字符串列表
+    """
+    hashes = [coinbase_hash_be] + tx_hashes_be
+    branch = []
+    i = 0  # coinbase index
+    while len(hashes) > 1:
+        if i % 2 == 1:
+            left = hashes[i - 1]
+            right = hashes[i]
+        else:
+            left = hashes[i]
+            right = hashes[i + 1] if i + 1 < len(hashes) else hashes[i]
+        combined = left + right
+        parent = dsha256(combined)
+        branch.append(bytes_to_hex(right if i % 2 == 0 else left))
+        # 更新 hashes
+        new_hashes = []
+        for j in range(0, len(hashes), 2):
+            l = hashes[j]
+            r = hashes[j + 1] if j + 1 < len(hashes) else l
+            new_hashes.append(dsha256(l + r))
+        hashes = new_hashes
+        # 更新 i
+        i = i // 2
+    return branch
 
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
@@ -336,9 +366,20 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             coinb1 = coinbase_hex
             coinb2 = ''
     
-        # 3) merkle branch: 用 GBT 的 transactions 列表中的 txid 字段 (RPC 返回通常是 BE hex)
+        # 替换 merkle_branch 计算
         transactions = gbt.get('transactions', [])
-        merkle_branch = [reverse_hex(tx.get('txid')) for tx in transactions if tx.get('txid')]
+        
+        coinbase_tx_hex = coinb1 + EXTRANONCE_PLACEHOLDER + coinb2
+        coinbase_hash_be = dsha256(hex_to_bytes(coinbase_tx_hex))
+
+        tx_hashes_be = []
+        for tx in transactions:
+            if tx.get('data'):
+                tx_hashes_be.append(dsha256(hex_to_bytes(tx['data'])))
+            elif tx.get('hash'):
+                tx_hashes_be.append(hex_to_bytes(tx['hash']))
+
+        merkle_branch = _compute_merkle_branch(coinbase_hash_be, tx_hashes_be)
 
         # 4) extranonce1 由代理生成并写入job（每个矿机仍会覆盖自己的extranonce1）
         # 这里生成一个 job-level extranonce1，以确保coinbase模板能包含至少一个代理extranonce1占位
@@ -527,13 +568,15 @@ class StratumMinerHandler(threading.Thread):
     # --- 发送/响应方法 ---
     # -----------------------
     def send_json(self, obj: Dict[str, Any]):
+        """统一发送 JSON 消息，压缩格式 + 确保 \n"""
         try:
-            data = (json.dumps(obj) + '\n').encode()
+            # 压缩 JSON：去掉空格，减小体积
+            data = (json.dumps(obj, separators=(',', ':')) + '\n').encode('utf-8')
             self.conn.sendall(data)
         except Exception as e:
             log("发送给矿机失败:", e)
             self.close()
-
+        
     def send_subscription_response(self, req_id):
         # Stratum 标准: 返回 extranonce1 和 extranonce2_size
         resp = {
@@ -567,7 +610,11 @@ class StratumMinerHandler(threading.Thread):
             return
         # 下发难度（solo 挖矿用网络难度）
         difficulty = 1  # 或从 nbits 计算
-        self.send_json({"id": None, "method": "mining.set_difficulty", "params": [difficulty]})
+        diff_msg = {"id": None, "method": "mining.set_difficulty", "params": [difficulty]}
+        self.send_json(diff_msg)
+
+        # 延迟 50ms 避免粘包
+        time.sleep(0.05)
         
         # 生成每个矿机专属 coinb1（包含矿机的 extranonce1）
         coinb1 = job.get('coinb1', '')
@@ -588,12 +635,17 @@ class StratumMinerHandler(threading.Thread):
         jid = job.get('job_id')
         self.current_job_id = jid
 
+        branch = job.get('merkle_branch', [])
+        if len(branch) > 20:
+            log(f"merkle_branch 过长 {len(branch)}，截断")
+            branch = branch[:20]
+        
         params = [
             jid,
             job.get('prevhash_be'),
             coinb1_filled,
             coinb2 or "",
-            job.get('merkle_branch', []),
+            branch,  # 已截断的安全 branch
             job.get('version_be'),
             job.get('nbits_be'),
             job.get('ntime_be'),
