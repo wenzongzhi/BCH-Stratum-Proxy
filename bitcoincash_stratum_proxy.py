@@ -28,6 +28,7 @@ from hashlib import sha256
 import requests
 from typing import List, Dict, Any, Optional, Tuple
 from queue import Empty, Full, Queue
+from runtime_status import RuntimeStatsRegistry, RuntimeStatusWriter
 
 # ===========================
 # === User configuration area (must be modified) ===
@@ -76,6 +77,15 @@ RPC_RETRY_BACKOFF = 2  # Index retreat base
 # enable/disable log output
 DEBUG = True
 MAX_MINERS = 20
+PROXY_VERSION = "1.0"
+RUNTIME_STATUS_INTERVAL = 1.0
+RUNTIME_STATUS_FILE = os.environ.get(
+    "BCH_RUNTIME_STATUS_FILE",
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "runtime_status.json",
+    ),
+)
 
 # ===========================
 # === Global states (for internal use) ===
@@ -98,6 +108,19 @@ _gbt_lock = threading.Lock()
 def log(*args):
     if DEBUG:
         print(time.strftime('%Y-%m-%d %H:%M:%S'), "[PROXY]", *args)
+
+RUNTIME_STATS = RuntimeStatsRegistry(
+    service_name="bitcoincash-stratum-proxy",
+    service_version=PROXY_VERSION,
+    network="mainnet",
+    listen_host=LISTEN_HOST,
+    listen_port=LISTEN_PORT,
+    max_miners=MAX_MINERS,
+    default_difficulty=MIN_SHARE_DIFF,
+    rpc_host=RPC_HOST,
+    rpc_port=RPC_PORT,
+    gbt_poll_interval_seconds=GBT_POLL_INTERVAL,
+)
 
 def dsha256(data: bytes) -> bytes:
     """ double-sha256, return digest bytes（big-endian order）"""
@@ -744,6 +767,7 @@ def gbt_poller():
                 }],
             )
             if not rpc_result.ok or not isinstance(rpc_result.result, dict):
+                RUNTIME_STATS.record_gbt_error(rpc_result.error)
                 time.sleep(GBT_POLL_INTERVAL)
                 continue
             gbt = rpc_result.result
@@ -751,6 +775,20 @@ def gbt_poller():
             height = gbt.get('height', -1)  # if can't get valid height value, return -1
             # Track ordered txids to detect template transaction changes.
             txids = tuple(tx.get('txid') for tx in gbt.get('transactions', []))
+
+            network_target = compact_to_target(str(gbt.get('bits', '')))
+            network_difficulty = (
+                hash_to_difficulty(network_target)
+                if network_target > 0
+                else None
+            )
+            RUNTIME_STATS.update_gbt(
+                height=height if isinstance(height, int) else None,
+                previous_block_hash=gbt.get('previousblockhash'),
+                bits=gbt.get('bits'),
+                network_difficulty=network_difficulty,
+                template_tx_count=len(txids) + 1,  # include coinbase
+            )
 
             need_broadcast = False
             clean_jobs = False
@@ -782,12 +820,14 @@ def gbt_poller():
                         _current_height = height
                         last_txids = txids
                         job_to_broadcast = candidate_job
+                        RUNTIME_STATS.update_job(candidate_job.get("job_id"))
 
             if job_to_broadcast:
                 log("boardcast new job to ASIC:", reason, "height=", height, "txs=", len(txids))
                 broadcast_job_to_miners(job_to_broadcast)
             time.sleep(GBT_POLL_INTERVAL)
         except Exception as e:
+            RUNTIME_STATS.record_gbt_error(e)
             log("GBT polling exception", e)
             time.sleep(GBT_POLL_INTERVAL)
 
@@ -808,6 +848,7 @@ class StratumMinerHandler(threading.Thread):
         # for example, conn=<socket>, addr=('192.168.1.100', 40231)
         self.conn = conn
         self.addr = addr
+        self.connection_id = f"{addr[0]}:{addr[1]}"
         self.running = True
 
         # Miner status
@@ -832,6 +873,12 @@ class StratumMinerHandler(threading.Thread):
 
         # use fifo to put and get the sumbit data of ASIC miner
         self.submit_queue = Queue(maxsize=1000)
+        RUNTIME_STATS.register_miner(
+            self.connection_id,
+            remote_ip=str(addr[0]),
+            remote_port=int(addr[1]),
+            initial_difficulty=self.difficulty,
+        )
         self.submit_thread = self.start_submit_worker()
 
         # socket read buffer
@@ -900,6 +947,9 @@ class StratumMinerHandler(threading.Thread):
                     _miners.remove(self)
         except Exception:
             pass
+
+        RUNTIME_STATS.unregister_miner(self.connection_id)
+
         try:
             self.conn.close()
         except Exception:
@@ -933,6 +983,7 @@ class StratumMinerHandler(threading.Thread):
             "error": None
         }
         self.subscribed = True
+        RUNTIME_STATS.set_subscribed(self.connection_id, True)
         self.send_json(resp)
         if self.authorized:
             with _gbt_lock:
@@ -941,6 +992,7 @@ class StratumMinerHandler(threading.Thread):
 
     def send_set_difficulty(self, difficulty):
         self.difficulty = difficulty
+        RUNTIME_STATS.set_difficulty(self.connection_id, difficulty)
 
         self.send_json({
             "id": None,
@@ -1054,6 +1106,12 @@ class StratumMinerHandler(threading.Thread):
         resp = {"id": req_id, "result": ok, "error": None}
         if ok:
             self.authorized = True
+            if self.payout_address is not None:
+                RUNTIME_STATS.set_authorized(
+                    self.connection_id,
+                    worker_name=self.worker_name,
+                    payout_address=self.payout_address,
+                )
         self.send_json(resp)
 
     def send_job(self, job: Dict[str, Any], force_clean_jobs: bool = False):
@@ -1099,6 +1157,7 @@ class StratumMinerHandler(threading.Thread):
                 f"len={len(full_coinb_hex)} job_id={job.get('job_id')}"
             )
         self.current_job_id = jid
+        RUNTIME_STATS.set_miner_job(self.connection_id, jid)
 
         branch = job.get('merkle_branch', [])
         if len(branch) > 20:
@@ -1162,7 +1221,7 @@ class StratumMinerHandler(threading.Thread):
         if method == "client.get_version":
             self.send_json({
                 "id": req_id,
-                "result": "BitcoinCash-Stratum-Proxy/1.0",
+                "result": f"BitcoinCash-Stratum-Proxy/{PROXY_VERSION}",
                 "error": None,
             })
         elif method == "mining.ping":
@@ -1287,7 +1346,9 @@ class StratumMinerHandler(threading.Thread):
                 if self.subscribed and _current_job:
                     self.send_job(_current_job, force_clean_jobs=True)
         elif method == "mining.submit":
+            RUNTIME_STATS.record_submit(self.connection_id)
             if not self.subscribed:
+                RUNTIME_STATS.record_rejected(self.connection_id, "not_subscribed")
                 self.send_json({
                     "id": req_id,
                     "result": False,
@@ -1295,6 +1356,7 @@ class StratumMinerHandler(threading.Thread):
                 })
                 return
             if not self.authorized:
+                RUNTIME_STATS.record_rejected(self.connection_id, "unauthorized")
                 self.send_json({
                     "id": req_id,
                     "result": False,
@@ -1305,6 +1367,7 @@ class StratumMinerHandler(threading.Thread):
             # params: worker, job_id, extranonce2, ntime, nonce,
             # and optionally version_bits.
             if not isinstance(params, list) or len(params) < 5:
+                RUNTIME_STATS.record_rejected(self.connection_id, "invalid_params")
                 self.send_json({
                     "id": req_id,
                     "result": False,
@@ -1340,6 +1403,7 @@ class StratumMinerHandler(threading.Thread):
                         oldest_share = next(iter(self.submitted_shares))
                         self.submitted_shares.pop(oldest_share, None)
             if duplicate_share:
+                RUNTIME_STATS.record_rejected(self.connection_id, "duplicate")
                 self.send_json({
                     "id": req_id,
                     "result": False,
@@ -1360,6 +1424,7 @@ class StratumMinerHandler(threading.Thread):
                     )
                 )
             except Full:
+                RUNTIME_STATS.record_rejected(self.connection_id, "queue_full")
                 with self.jobs_lock:
                     self.submitted_shares.pop(share_key, None)
                 self.send_json({
@@ -1368,6 +1433,7 @@ class StratumMinerHandler(threading.Thread):
                     "error": [20, "Submit queue full", None],
                 })
             except Exception as e:
+                RUNTIME_STATS.record_rejected(self.connection_id, "queue_error")
                 log("Failed to queue submit:", e)
         else:
             self.send_json({
@@ -1401,6 +1467,7 @@ class StratumMinerHandler(threading.Thread):
             with self.jobs_lock:
                 job = self.jobs.get(str(job_id))
             if not job:
+                RUNTIME_STATS.record_rejected(self.connection_id, "stale")
                 self.send_json({"id": req_id, "result": False, "error": [21, "Stale", None]})
                 return
             gbt = job.get("gbt")
@@ -1460,6 +1527,7 @@ class StratumMinerHandler(threading.Thread):
             # network target (input job['nbits_be'], big-endian hex)
             network_target = compact_to_target(job.get('nbits_be'))
             if network_target == 0:
+                RUNTIME_STATS.record_rejected(self.connection_id, "invalid_target")
                 self.send_json({
                     "id": req_id,
                     "result": False,
@@ -1470,9 +1538,14 @@ class StratumMinerHandler(threading.Thread):
             # share difficulty
             share_target = difficulty_to_target(self.difficulty)
             share_diff = hash_to_difficulty(header_hash_int)
+            RUNTIME_STATS.record_share_difficulty(
+                self.connection_id,
+                share_diff,
+            )
 
             # 1. Difficulty too low -> reject
             if header_hash_int > share_target:
+                RUNTIME_STATS.record_rejected(self.connection_id, "low_difficulty")
                 self.send_json({
                     "id": req_id,
                     "result": False,
@@ -1486,6 +1559,7 @@ class StratumMinerHandler(threading.Thread):
 
             # 2. Reaching network difficulty -> submitblock
             if header_hash_int <= network_target:
+                RUNTIME_STATS.record_block_candidate(self.connection_id)
                 # Construct the complete block and commit
                 txs = [coinbase_hex] + _get_template_transaction_data(
                     gbt.get('transactions', [])
@@ -1502,6 +1576,7 @@ class StratumMinerHandler(threading.Thread):
                     gbt,
                 )
                 if not proposal_ok:
+                    RUNTIME_STATS.record_rejected(self.connection_id, "proposal_rejected")
                     self.send_json({
                         "id": req_id,
                         "result": False,
@@ -1533,6 +1608,17 @@ class StratumMinerHandler(threading.Thread):
                         ),
                         None,
                     ]
+                if accepted:
+                    RUNTIME_STATS.record_accepted(
+                        self.connection_id,
+                        self.difficulty,
+                    )
+                    RUNTIME_STATS.record_block_accepted(self.connection_id)
+                else:
+                    RUNTIME_STATS.record_rejected(
+                        self.connection_id,
+                        "block_submit_rejected",
+                    )
                 self.send_json({
                     "id": req_id,
                     "result": accepted,
@@ -1544,6 +1630,10 @@ class StratumMinerHandler(threading.Thread):
                 )
             else:
                 # Accept a proxy share that is below network difficulty.
+                RUNTIME_STATS.record_accepted(
+                    self.connection_id,
+                    self.difficulty,
+                )
                 self.send_json({"id": req_id, "result": True, "error": None})
                 log(
                     f"Accept share: diff={share_diff:.3f} "
@@ -1551,6 +1641,7 @@ class StratumMinerHandler(threading.Thread):
                 )
             return
         except ValueError as e:
+            RUNTIME_STATS.record_rejected(self.connection_id, "invalid_share")
             log("Invalid share submission:", e)
             self.send_json({
                 "id": req_id,
@@ -1558,6 +1649,7 @@ class StratumMinerHandler(threading.Thread):
                 "error": [20, str(e), None],
             })
         except Exception as e:
+            RUNTIME_STATS.record_rejected(self.connection_id, "internal_error")
             log("Handling submit exceptions:", e)
             self.send_json({
                 "id": req_id,
@@ -1620,11 +1712,29 @@ def main():
         )
         exit(1)
 
+    status_writer = RuntimeStatusWriter(
+        RUNTIME_STATS,
+        RUNTIME_STATUS_FILE,
+        interval_seconds=RUNTIME_STATUS_INTERVAL,
+        log_fn=log,
+    )
+    status_writer.start()
+    log("Runtime status file:", RUNTIME_STATUS_FILE)
+
     # 'daemon=True' means if main thread is end, this child Thread will be killed.
     poller_thread = threading.Thread(target=gbt_poller, daemon=True)
     poller_thread.start()   # run child thread gbt_poller
 
-    start_stratum_server(LISTEN_HOST, LISTEN_PORT)  # run main thread start_stratum_server
+    try:
+        start_stratum_server(LISTEN_HOST, LISTEN_PORT)
+    finally:
+        status_writer.stop()
+        status_writer.join(timeout=2.0)
+        RUNTIME_STATS.set_service_state("stopped")
+        try:
+            status_writer.write_once()
+        except Exception as e:
+            log("Failed to write final runtime status:", e)
 
 # ===========================
 # === mainloop entry ===
